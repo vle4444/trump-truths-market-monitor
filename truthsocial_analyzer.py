@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-TruthSocial RSS Scraper with OpenAI Analysis
-Monitors Donald Trump's posts and analyzes them for market impact using OpenAI
+TruthSocial RSS Scraper with Claude Analysis
+Monitors Donald Trump's posts and analyzes them for market impact using Anthropic Claude.
+Emits structured JSON analyses for downstream consumption (e.g. dashboard).
 """
 
 import feedparser
@@ -13,8 +14,41 @@ from typing import List, Dict, Optional
 import re
 import os
 from dotenv import load_dotenv
-from openai import OpenAI
-import requests
+from anthropic import Anthropic
+
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+SYSTEM_PROMPT = """You are an expert financial markets analyst.
+Analyze the following social media post for potential market impact across major asset classes.
+
+You will receive a `post_kind` hint along with the post body. Use it to calibrate severity:
+- `post_kind=original`  — Trump's own first-person words. Severity is uncapped; calibrate to actual content.
+- `post_kind=link_share` — Trump shared a media headline / URL with little or no original commentary. The information is already public and most likely already priced in. **Severity must not exceed `low`.** Use `none` unless the underlying news represents an imminent, concrete policy commitment that markets have not yet absorbed.
+
+Respond with ONLY a valid JSON object — no markdown fences, no preamble — matching this exact schema:
+
+{
+  "has_market_impact": <boolean>,
+  "severity": "none" | "low" | "medium" | "high",
+  "summary": "<1-2 sentence high-level take>",
+  "equities":    {"direction": "positive|negative|neutral|uncertain", "sectors":    [<string>], "reasoning": "<string>"},
+  "commodities": {"direction": "positive|negative|neutral|uncertain", "items":      [<string>], "reasoning": "<string>"},
+  "fx":          {"direction": "positive|negative|neutral|uncertain", "currencies": [<string>], "reasoning": "<string>"},
+  "bonds":       {"direction": "positive|negative|neutral|uncertain", "reasoning":  "<string>"},
+  "crypto":      {"direction": "positive|negative|neutral|uncertain", "reasoning":  "<string>"}
+}
+
+Severity calibration:
+- "none"   — no market signal at all (personal grievance, social commentary, reshared old news).
+- "low"    — vague rhetoric or already-priced-in information.
+- "medium" — concrete first-person policy direction with plausible near-term impact, but lacking specifics on timing/magnitude.
+- "high"   — clear, original, near-term, large-magnitude policy / trade / regulatory commitment. Reserved for first-person announcements with specific actions ("I am ordering X", "Effective Monday Y will happen", concrete tariff %, named sanctions, troop movements with dates, etc.). Reshared headlines never qualify.
+
+Rules:
+- "direction" must be exactly one of the four lowercase values.
+- If an asset class is unaffected, use "neutral" with empty arrays and reasoning "No direct or indirect link.".
+- Be skeptical: most posts have no real market signal. Default to lower severity when in doubt.
+"""
 
 # Load environment variables
 load_dotenv('.env')
@@ -37,50 +71,28 @@ class TruthSocialAnalyzer:
         self.posts_file = 'seen_posts_analyzer.json'
         self.analysis_file = 'post_analyses.json'
         
-        # Initialize OpenAI client
-        self.openai_client = None
-        self.init_openai()
-        
-        # Initialize Telegram bot
-        self.telegram_bot_token = None
-        self.user_id = None
-        self.init_telegram()
-        
+        # Initialize Claude client
+        self.claude_client: Optional[Anthropic] = None
+        self.model = CLAUDE_MODEL
+        self.init_claude()
+
         # Load existing data
         self.load_seen_posts()
         self.load_analyses()
-    
-    def init_openai(self):
-        """Initialize OpenAI client"""
-        api_key = os.getenv('OPENAI_KEY')
-        if not api_key:
-            logger.error("OPENAI_KEY not found in environment variables")
-            logger.error("Please set OPENAI_KEY in your .env file")
+
+    def init_claude(self):
+        """Initialize Anthropic Claude client (reads ANTHROPIC_API_KEY from env)."""
+        if not os.getenv('ANTHROPIC_API_KEY'):
+            logger.error("ANTHROPIC_API_KEY not found in environment variables")
+            logger.error("Please set ANTHROPIC_API_KEY in your .env file")
             return
-        
+
         try:
-            self.openai_client = OpenAI(api_key=api_key)
-            logger.info("✅ OpenAI client initialized successfully")
+            self.claude_client = Anthropic()
+            logger.info(f"Claude client initialized (model={self.model})")
         except Exception as e:
-            logger.error(f"Failed to initialize OpenAI client: {e}")
-    
-    def init_telegram(self):
-        """Initialize Telegram bot"""
-        self.telegram_bot_token = os.getenv('TELEGRAM_BOT_ID')
-        self.user_id = os.getenv('USER_ID')
-        
-        if not self.telegram_bot_token:
-            logger.error("TELEGRAM_BOT_ID not found in environment variables")
-            logger.error("Please set TELEGRAM_BOT_ID in your .env file")
-            return
-        
-        if not self.user_id:
-            logger.error("USER_ID not found in environment variables")
-            logger.error("Please set USER_ID in your .env file")
-            return
-        
-        logger.info("✅ Telegram bot credentials loaded successfully")
-    
+            logger.error(f"Failed to initialize Claude client: {e}")
+
     def load_seen_posts(self):
         """Load previously seen posts from file"""
         try:
@@ -188,107 +200,59 @@ class TruthSocialAnalyzer:
         
         return None
     
-    def analyze_post_with_openai(self, post_text: str) -> Optional[str]:
-        """Analyze post using OpenAI"""
-        if not self.openai_client:
-            logger.error("OpenAI client not initialized")
+    @staticmethod
+    def classify_post_kind(post_content: str) -> str:
+        """Classify a TruthSocial post as original / link_share.
+
+        link_share: post contains a URL AND the non-URL text is short enough
+                    (<= 25 words) that it looks like a media headline reshare
+                    rather than original commentary.
+        original:   everything else, including short punchy first-person posts
+                    (Trump's policy declarations are often terse).
+        """
+        text = post_content.strip()
+        url_match = re.search(r'https?://\S+', text)
+        text_without_urls = re.sub(r'https?://\S+', '', text).strip()
+        word_count = len(text_without_urls.split())
+
+        if url_match and word_count <= 25:
+            return "link_share"
+        return "original"
+
+    def analyze_post_with_claude(self, post_content: str) -> Optional[Dict]:
+        """Analyze post using Claude. Returns parsed JSON dict or None on failure."""
+        if not self.claude_client:
+            logger.error("Claude client not initialized")
             return None
-        
-        prompt = f"""You are an expert geopolitical and financial markets analyst.  
-You will be given a social media post written by Donald Trump.  
-Your job is to evaluate its potential market impact and produce a structured analysis.
 
-Follow this framework exactly:
-
----
-**Analysis:**  
-- Market Impact: [Yes/No]  
-
-- Equities: [Positive / Negative / Neutral / Uncertain]  
-  - Which sectors/industries are affected? Why?  
-
-- Commodities: [Positive / Negative / Neutral / Uncertain]  
-  - Which commodities are affected (e.g., oil, gold, rare earths, agriculture)? Why?  
-
-- Foreign Exchange (FX): [Positive / Negative / Neutral / Uncertain]  
-  - Which currencies are affected (e.g., USD, CNY, EUR, JPY)? Why?  
-
-- Bonds / Interest Rates: [Positive / Negative / Neutral / Uncertain]  
-  - Impact on Treasuries, yields, risk sentiment?  
-
-- Crypto: [Positive / Negative / Neutral / Uncertain]  
-  - Does the post indirectly impact crypto markets (risk-on/off sentiment, regulation, etc.)?  
-
-- Reasoning: [Concise explanation of why these impacts are expected.]  
----
-
-If no material impact is expected, state clearly:  
-"**No material market impact expected.**"
-
-Post to analyze:
-"{post_text}"
-"""
+        post_kind = self.classify_post_kind(post_content)
+        user_message = f"post_kind={post_kind}\n\n{post_content}"
 
         try:
-            logger.info("🤖 Analyzing post with OpenAI...")
-            response = self.openai_client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are an expert geopolitical and financial markets analyst."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=500,
-                temperature=0.3
+            logger.info(f"Analyzing post with Claude (kind={post_kind})...")
+            response = self.claude_client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
             )
-            
-            analysis = response.choices[0].message.content.strip()
-            logger.info("✅ OpenAI analysis completed")
-            return analysis
-            
-        except Exception as e:
-            logger.error(f"OpenAI analysis failed: {e}")
-            if "quota" in str(e).lower() or "billing" in str(e).lower():
-                logger.error("💳 OpenAI quota exceeded - please check your billing")
+            text = response.content[0].text.strip()
+
+            # Defensive: strip accidental code fences if the model adds them
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+            parsed = json.loads(text)
+            logger.info(f"Claude analysis completed (severity={parsed.get('severity', '?')})")
+            return parsed
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Claude returned non-JSON response: {e}")
+            logger.error(f"Raw response: {text[:500]}")
             return None
-    
-    def send_telegram_message(self, post: Dict, analysis: str):
-        """Send post and analysis to Telegram using requests"""
-        if not self.telegram_bot_token or not self.user_id:
-            logger.warning("Telegram bot credentials not available, skipping notification")
-            return
-        
-        try:
-            # Format the message (simplified to avoid Markdown issues)
-            message = f"""🆕 NEW TRUMP POST ANALYSIS
-
-📅 Time: {post.get('timestamp', 'Unknown')}
-🆔 Post ID: {post['id']}
-🔗 URL: {post['url']}
-
-📝 POST CONTENT:
-{post['text']}
-
-🤖 MARKET ANALYSIS:
-{analysis}
-
-📊 Analyzed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""
-
-            # Send the message using Telegram Bot API
-            url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-            data = {
-                'chat_id': self.user_id,
-                'text': message
-            }
-            
-            response = requests.post(url, data=data)
-            response.raise_for_status()
-            
-            logger.info("✅ Telegram message sent successfully")
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to send Telegram message: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error sending Telegram message: {e}")
+            logger.error(f"Claude analysis failed: {e}")
+            return None
     
     def check_for_new_posts(self) -> List[Dict]:
         """Check for new posts and return any new ones found"""
@@ -353,28 +317,27 @@ Post to analyze:
         print(post['text'])
         print(f"{'='*80}")
         
-        # Analyze with OpenAI
-        analysis = self.analyze_post_with_openai(post['text'])
-        
+        # Analyze with Claude
+        analysis = self.analyze_post_with_claude(post['text'])
+
         if analysis:
-            print(f"🤖 OPENAI MARKET ANALYSIS:")
+            print(f"🤖 CLAUDE MARKET ANALYSIS:")
             print(f"{'='*80}")
-            print(analysis)
+            print(json.dumps(analysis, indent=2))
             print(f"{'='*80}")
-            
-            # Save analysis
+
+            # Save analysis (Phase 3 schema)
             analysis_data = {
                 'post_id': post['id'],
-                'post_text': post['text'],
-                'post_timestamp': post.get('timestamp'),
+                'timestamp': post.get('timestamp'),
+                'url': post.get('url'),
+                'content': post['text'],
+                'analyzed_at': datetime.now().isoformat(),
+                'model': self.model,
                 'analysis': analysis,
-                'analyzed_at': datetime.now().isoformat()
             }
             self.analyses.append(analysis_data)
             self.save_analyses()
-            
-            # Send to Telegram
-            self.send_telegram_message(post, analysis)
         else:
             print(f"❌ Analysis failed")
         
@@ -385,47 +348,15 @@ Post to analyze:
         # Log the new post
         logger.info(f"New post processed - ID: {post['id']}, Length: {len(post['text'])} chars")
     
-    def test_analyzer(self):
-        """Test the analyzer with recent posts"""
-        print("🧪 Testing TruthSocial Analyzer")
-        print("=" * 50)
-        
-        feed = self.fetch_rss_feed()
-        if not feed:
-            print("❌ Failed to fetch RSS feed")
-            return
-        
-        print(f"✅ Successfully fetched RSS feed")
-        print(f"📊 Feed title: {feed.feed.get('title', 'Unknown')}")
-        print(f"📊 Total entries: {len(feed.entries)}")
-        print()
-        
-        print("📝 Testing analysis on recent posts:")
-        for i, entry in enumerate(feed.entries[:3]):  # Test first 3 posts
-            post_data = self.extract_post_data(entry)
-            if post_data:
-                print(f"\n--- Test Analysis {i+1} ---")
-                print(f"Post: {post_data['text'][:100]}...")
-                
-                analysis = self.analyze_post_with_openai(post_data['text'])
-                if analysis:
-                    print(f"Analysis: {analysis}")
-                else:
-                    print("Analysis failed")
-
 def main():
     """Main function to run the analyzer"""
     analyzer = TruthSocialAnalyzer()
-    
-    # Test the analyzer first
-    analyzer.test_analyzer()
-    
+
     print("\n" + "="*50)
     print("Starting continuous monitoring...")
     print("Press Ctrl+C to stop")
     print("="*50)
-    
-    # Run the analyzer
+
     analyzer.run_analyzer(interval=30)
 
 if __name__ == "__main__":

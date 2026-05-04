@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trump Truths · Market Impact Monitor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.3; }
+    }
+    .pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+    .scrollbar-thin::-webkit-scrollbar { width: 8px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-900 min-h-screen">
+
+  <!-- Sticky header -->
+  <header class="sticky top-0 z-20 bg-white border-b border-slate-200 shadow-sm">
+    <div class="max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+      <h1 class="text-xl font-bold tracking-tight">Trump Truths <span class="text-slate-400">·</span> Market Impact Monitor</h1>
+      <div class="flex items-center gap-6 text-sm">
+        <div><span class="text-slate-500">Total:</span> <span id="stat-total" class="font-semibold tabular-nums">—</span></div>
+        <div><span class="text-slate-500">With impact:</span> <span id="stat-impact" class="font-semibold tabular-nums">—</span></div>
+        <div><span class="text-slate-500">Last:</span> <span id="stat-last" class="font-semibold tabular-nums">—</span></div>
+        <div class="flex items-center gap-2 text-slate-500">
+          <span id="poll-dot" class="inline-block w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>
+          <span class="text-xs">live</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Filter row -->
+    <div class="max-w-7xl mx-auto px-6 pb-3 flex flex-wrap items-center gap-3 text-sm">
+      <span class="text-slate-500 font-medium">Severity:</span>
+      <div id="severity-chips" class="flex gap-2"></div>
+      <span class="text-slate-300">|</span>
+      <span class="text-slate-500 font-medium">Asset class:</span>
+      <div id="asset-chips" class="flex gap-2"></div>
+      <button id="clear-filters" class="ml-auto text-blue-600 hover:underline text-xs">Clear filters</button>
+    </div>
+  </header>
+
+  <!-- Main two-column layout -->
+  <main class="max-w-7xl mx-auto px-6 py-6 grid grid-cols-1 lg:grid-cols-5 gap-6">
+
+    <!-- Feed (60% ≈ 3/5) -->
+    <section class="lg:col-span-3">
+      <div id="feed" class="space-y-2 max-h-[calc(100vh-180px)] overflow-y-auto pr-2 scrollbar-thin"></div>
+      <div id="feed-empty" class="hidden text-center text-slate-500 text-sm py-12">
+        No posts match the current filters.
+      </div>
+    </section>
+
+    <!-- Detail panel (40% ≈ 2/5) -->
+    <aside class="lg:col-span-2">
+      <div id="detail" class="bg-white border border-slate-200 rounded-lg p-5 sticky top-[140px] max-h-[calc(100vh-180px)] overflow-y-auto scrollbar-thin">
+        <div id="detail-empty" class="text-slate-400 text-sm text-center py-12">
+          Select a post on the left to view its full analysis.
+        </div>
+        <div id="detail-content" class="hidden"></div>
+      </div>
+    </aside>
+  </main>
+
+<script>
+'use strict';
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+const POLL_INTERVAL_MS = 15000;
+const SEVERITIES = ['none', 'low', 'medium', 'high'];
+const ASSETS = ['equities', 'commodities', 'fx', 'bonds', 'crypto'];
+const ASSET_LABELS = {
+  equities: 'Equities', commodities: 'Commodities', fx: 'FX', bonds: 'Bonds', crypto: 'Crypto'
+};
+const SEV_COLOR = {
+  none:   { bg: 'bg-slate-100',  text: 'text-slate-600',  ring: 'ring-slate-300',  badge: 'bg-slate-400' },
+  low:    { bg: 'bg-blue-50',    text: 'text-blue-700',   ring: 'ring-blue-300',   badge: 'bg-blue-500' },
+  medium: { bg: 'bg-amber-50',   text: 'text-amber-700',  ring: 'ring-amber-300',  badge: 'bg-amber-500' },
+  high:   { bg: 'bg-red-50',     text: 'text-red-700',    ring: 'ring-red-300',    badge: 'bg-red-600' },
+};
+const DIR_COLOR = {
+  positive:  { text: 'text-emerald-600', bg: 'bg-emerald-50',  border: 'border-emerald-200', sym: '↑' },
+  negative:  { text: 'text-red-600',     bg: 'bg-red-50',      border: 'border-red-200',     sym: '↓' },
+  neutral:   { text: 'text-slate-500',   bg: 'bg-slate-50',    border: 'border-slate-200',   sym: '→' },
+  uncertain: { text: 'text-amber-600',   bg: 'bg-amber-50',    border: 'border-amber-200',   sym: '?' },
+};
+
+// -----------------------------------------------------------------------------
+// State (persisted to localStorage)
+// -----------------------------------------------------------------------------
+const FILTER_KEY = 'trumptruths.filters.v1';
+const SELECTED_KEY = 'trumptruths.selected.v1';
+
+function loadFilters() {
+  try {
+    const raw = localStorage.getItem(FILTER_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (_) { /* fall through */ }
+  return { severities: [...SEVERITIES], assets: [] };
+}
+function saveFilters() {
+  try { localStorage.setItem(FILTER_KEY, JSON.stringify(state.filters)); } catch (_) {}
+}
+
+const state = {
+  posts: [],
+  filters: loadFilters(),
+  selectedId: localStorage.getItem(SELECTED_KEY) || null,
+  lastIdSet: '',
+};
+
+// -----------------------------------------------------------------------------
+// Time helpers
+// -----------------------------------------------------------------------------
+function relativeTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const sec = (Date.now() - d.getTime()) / 1000;
+  if (sec < 5) return 'just now';
+  if (sec < 60) return `${Math.floor(sec)}s ago`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
+
+// -----------------------------------------------------------------------------
+// Filter chips
+// -----------------------------------------------------------------------------
+function renderFilterChips() {
+  const sevContainer = document.getElementById('severity-chips');
+  sevContainer.innerHTML = '';
+  for (const sev of SEVERITIES) {
+    const active = state.filters.severities.includes(sev);
+    const c = SEV_COLOR[sev];
+    const btn = document.createElement('button');
+    btn.className = [
+      'px-3 py-1 rounded-full text-xs font-medium transition',
+      active ? `${c.bg} ${c.text} ring-1 ${c.ring}` : 'bg-slate-100 text-slate-400 hover:bg-slate-200',
+    ].join(' ');
+    btn.textContent = sev;
+    btn.onclick = () => {
+      const i = state.filters.severities.indexOf(sev);
+      if (i >= 0) state.filters.severities.splice(i, 1);
+      else state.filters.severities.push(sev);
+      saveFilters();
+      renderFilterChips();
+      renderFeed();
+    };
+    sevContainer.appendChild(btn);
+  }
+
+  const assetContainer = document.getElementById('asset-chips');
+  assetContainer.innerHTML = '';
+  for (const asset of ASSETS) {
+    const active = state.filters.assets.includes(asset);
+    const btn = document.createElement('button');
+    btn.className = [
+      'px-3 py-1 rounded-full text-xs font-medium transition',
+      active ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-300' : 'bg-slate-100 text-slate-400 hover:bg-slate-200',
+    ].join(' ');
+    btn.textContent = ASSET_LABELS[asset];
+    btn.onclick = () => {
+      const i = state.filters.assets.indexOf(asset);
+      if (i >= 0) state.filters.assets.splice(i, 1);
+      else state.filters.assets.push(asset);
+      saveFilters();
+      renderFilterChips();
+      renderFeed();
+    };
+    assetContainer.appendChild(btn);
+  }
+}
+
+document.getElementById('clear-filters').onclick = () => {
+  state.filters = { severities: [...SEVERITIES], assets: [] };
+  saveFilters();
+  renderFilterChips();
+  renderFeed();
+};
+
+// -----------------------------------------------------------------------------
+// Filtering
+// -----------------------------------------------------------------------------
+function passesFilters(post) {
+  const a = post.analysis || {};
+  const sev = a.severity || 'none';
+  if (!state.filters.severities.includes(sev)) return false;
+  if (state.filters.assets.length > 0) {
+    const hasNonNeutral = state.filters.assets.some((asset) => {
+      const dir = (a[asset] || {}).direction;
+      return dir && dir !== 'neutral';
+    });
+    if (!hasNonNeutral) return false;
+  }
+  return true;
+}
+
+// -----------------------------------------------------------------------------
+// Feed rendering
+// -----------------------------------------------------------------------------
+function renderFeed() {
+  const feed = document.getElementById('feed');
+  const empty = document.getElementById('feed-empty');
+  const filtered = state.posts.filter(passesFilters);
+
+  if (filtered.length === 0) {
+    feed.innerHTML = '';
+    empty.classList.remove('hidden');
+    return;
+  }
+  empty.classList.add('hidden');
+
+  feed.innerHTML = filtered.map((p) => {
+    const a = p.analysis || {};
+    const sev = a.severity || 'none';
+    const c = SEV_COLOR[sev];
+    const isSelected = p.post_id === state.selectedId;
+    const excerpt = (p.content || '').slice(0, 200) + ((p.content || '').length > 200 ? '…' : '');
+    const nonNeutralAssets = ASSETS.filter((asset) => {
+      const dir = (a[asset] || {}).direction;
+      return dir && dir !== 'neutral';
+    });
+    const assetChips = nonNeutralAssets.map((asset) => {
+      const dir = (a[asset] || {}).direction;
+      const dc = DIR_COLOR[dir] || DIR_COLOR.neutral;
+      return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${dc.bg} ${dc.text} border ${dc.border}">
+        <span>${dc.sym}</span><span>${ASSET_LABELS[asset]}</span>
+      </span>`;
+    }).join('');
+
+    return `
+      <button data-post-id="${p.post_id}"
+        class="block w-full text-left bg-white rounded-lg border border-slate-200 p-4 hover:border-slate-300 transition
+               ${isSelected ? 'border-l-4 !border-l-indigo-500 ring-1 ring-indigo-100' : ''}">
+        <div class="flex items-start justify-between gap-3 mb-2">
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-2 h-2 rounded-full ${c.badge}"></span>
+            <span class="text-xs font-semibold uppercase tracking-wide ${c.text}">${sev}</span>
+            <span class="text-xs text-slate-400">·</span>
+            <span class="text-xs text-slate-500" data-rel="${p.analyzed_at || ''}">${relativeTime(p.analyzed_at)}</span>
+          </div>
+          <span class="text-xs text-slate-400 font-mono">#${p.post_id || '?'}</span>
+        </div>
+        <p class="text-sm text-slate-700 leading-relaxed mb-2">${escapeHtml(excerpt)}</p>
+        ${assetChips ? `<div class="flex flex-wrap gap-1 mt-2">${assetChips}</div>` : ''}
+      </button>
+    `;
+  }).join('');
+
+  for (const btn of feed.querySelectorAll('[data-post-id]')) {
+    btn.onclick = () => {
+      state.selectedId = btn.getAttribute('data-post-id');
+      try { localStorage.setItem(SELECTED_KEY, state.selectedId); } catch (_) {}
+      renderFeed();
+      renderDetail();
+    };
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// -----------------------------------------------------------------------------
+// Detail panel
+// -----------------------------------------------------------------------------
+function renderDetail() {
+  const empty = document.getElementById('detail-empty');
+  const content = document.getElementById('detail-content');
+
+  const post = state.posts.find((p) => p.post_id === state.selectedId);
+  if (!post) {
+    empty.classList.remove('hidden');
+    content.classList.add('hidden');
+    content.innerHTML = '';
+    return;
+  }
+
+  const a = post.analysis || {};
+  const sev = a.severity || 'none';
+  const sc = SEV_COLOR[sev];
+
+  const assetCards = ASSETS.map((asset) => {
+    const ax = a[asset] || {};
+    const dir = ax.direction || 'neutral';
+    const dc = DIR_COLOR[dir] || DIR_COLOR.neutral;
+    const items = ax.sectors || ax.items || ax.currencies || [];
+    const itemChips = items.map((it) =>
+      `<span class="inline-block px-2 py-0.5 rounded bg-white border border-slate-200 text-xs text-slate-700">${escapeHtml(it)}</span>`
+    ).join(' ');
+    return `
+      <div class="rounded-lg border ${dc.border} ${dc.bg} p-3">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">${ASSET_LABELS[asset]}</span>
+          <span class="text-sm font-semibold ${dc.text}">${dc.sym} ${dir}</span>
+        </div>
+        ${itemChips ? `<div class="flex flex-wrap gap-1 mb-2">${itemChips}</div>` : ''}
+        <p class="text-xs text-slate-700 leading-relaxed">${escapeHtml(ax.reasoning || '')}</p>
+      </div>
+    `;
+  }).join('');
+
+  content.innerHTML = `
+    <div class="flex items-center gap-2 mb-3">
+      <span class="inline-block w-2.5 h-2.5 rounded-full ${sc.badge}"></span>
+      <span class="text-xs font-bold uppercase tracking-wider ${sc.text}">Severity: ${sev}</span>
+      <span class="text-xs text-slate-400">·</span>
+      <span class="text-xs text-slate-500">#${escapeHtml(post.post_id || '?')}</span>
+    </div>
+
+    <div class="text-sm text-slate-800 mb-3 leading-relaxed whitespace-pre-wrap">${escapeHtml(post.content || '')}</div>
+
+    ${post.url ? `<a href="${escapeHtml(post.url)}" target="_blank" rel="noopener" class="text-xs text-blue-600 hover:underline mb-4 inline-block">Open source ↗</a>` : ''}
+
+    <div class="bg-slate-100 rounded-lg p-3 mb-4 border-l-4 border-slate-400">
+      <div class="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-1">Summary</div>
+      <p class="text-sm text-slate-800">${escapeHtml(a.summary || '—')}</p>
+    </div>
+
+    <div class="grid grid-cols-1 gap-2 mb-3">${assetCards}</div>
+
+    <div class="text-xs text-slate-400 pt-3 border-t border-slate-100">
+      Analyzed ${escapeHtml(post.analyzed_at || '—')} · model <span class="font-mono">${escapeHtml(post.model || '—')}</span>
+    </div>
+  `;
+
+  empty.classList.add('hidden');
+  content.classList.remove('hidden');
+}
+
+// -----------------------------------------------------------------------------
+// Stats header
+// -----------------------------------------------------------------------------
+function renderStats(stats) {
+  document.getElementById('stat-total').textContent = stats.total ?? 0;
+  document.getElementById('stat-impact').textContent = stats.with_impact ?? 0;
+  document.getElementById('stat-last').textContent = stats.last_analyzed_at ? relativeTime(stats.last_analyzed_at) : '—';
+}
+
+// -----------------------------------------------------------------------------
+// Polling
+// -----------------------------------------------------------------------------
+async function fetchAndRender() {
+  try {
+    document.getElementById('poll-dot').classList.remove('bg-red-500');
+    document.getElementById('poll-dot').classList.add('bg-emerald-500');
+    const [postsRes, statsRes] = await Promise.all([
+      fetch('/api/posts'),
+      fetch('/api/stats'),
+    ]);
+    if (!postsRes.ok || !statsRes.ok) throw new Error('fetch failed');
+    const posts = await postsRes.json();
+    const stats = await statsRes.json();
+
+    const idSet = posts.map((p) => p.post_id).join(',');
+    const changed = idSet !== state.lastIdSet;
+    state.posts = posts;
+    state.lastIdSet = idSet;
+
+    renderStats(stats);
+    if (changed) renderFeed();
+    renderDetail();      // re-render detail to keep relative-time fresh
+  } catch (err) {
+    console.warn('Poll failed', err);
+    document.getElementById('poll-dot').classList.remove('bg-emerald-500');
+    document.getElementById('poll-dot').classList.add('bg-red-500');
+  }
+}
+
+// Refresh relative-time labels every 30s without re-fetching
+setInterval(() => {
+  for (const el of document.querySelectorAll('[data-rel]')) {
+    const iso = el.getAttribute('data-rel');
+    if (iso) el.textContent = relativeTime(iso);
+  }
+}, 30000);
+
+// -----------------------------------------------------------------------------
+// Init
+// -----------------------------------------------------------------------------
+renderFilterChips();
+fetchAndRender();
+setInterval(fetchAndRender, POLL_INTERVAL_MS);
+</script>
+
+</body>
+</html>
