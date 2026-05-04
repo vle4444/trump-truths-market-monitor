@@ -1,12 +1,24 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import json
+import logging
+
+from dotenv import load_dotenv
+
+from . import behavior
+
+# Load env so Claude calls from /api/behavior pick up ANTHROPIC_API_KEY.
+ROOT = Path(__file__).parent.parent
+load_dotenv(ROOT / ".env")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TrumpTruths Market Analyzer")
-ROOT = Path(__file__).parent.parent
 ANALYSES_FILE = ROOT / "post_analyses.json"
+BEHAVIOR_CACHE = ROOT / "behavior_cache.json"
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -46,6 +58,43 @@ def get_stats():
         "by_severity": by_severity,
         "last_analyzed_at": last,
     }
+
+
+@app.get("/api/behavior")
+def get_behavior(
+    force: bool = Query(False, description="Force regeneration, bypassing cache"),
+    cache_only: bool = Query(False, description="Return cache if present, never generate"),
+):
+    """Return the latest behavioral forecast.
+
+    Generation is an explicit user action — the endpoint never silently spends
+    Claude credits. Behavior:
+    - cache exists, no `force`        -> return cache (with `is_stale` flag if TTL exceeded)
+    - cache missing, `cache_only=1`   -> 204 No Content (UI shows empty state)
+    - cache missing, no force         -> generate ONCE on first hit, cache, return
+    - `force=1`                       -> regenerate, overwrite cache, return
+    """
+    from fastapi.responses import Response
+
+    cached = behavior.load_cached(BEHAVIOR_CACHE)
+
+    if cached and not force:
+        return {**cached, "from_cache": True, "is_stale": not behavior.is_fresh(cached)}
+
+    if cache_only:
+        return Response(status_code=204)
+
+    try:
+        payload = behavior.generate_behavior(ANALYSES_FILE)
+    except Exception as e:
+        logger.exception("behavior generation failed")
+        if cached:
+            return {**cached, "from_cache": True, "is_stale": True,
+                    "warning": f"regen failed: {e}; serving stale"}
+        raise HTTPException(status_code=502, detail=f"Behavior generation failed: {e}")
+
+    behavior.save_cache(BEHAVIOR_CACHE, payload)
+    return {**payload, "from_cache": False, "is_stale": False}
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

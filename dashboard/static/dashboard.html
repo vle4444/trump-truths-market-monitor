@@ -20,6 +20,49 @@
     .scrollbar-thin::-webkit-scrollbar { width: 8px; }
     .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
     .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+
+    /* ---------- Dark theme overrides (data-theme="dark" on <html>) ----------
+       Using CSS attribute selectors so we can layer on top of Tailwind utility
+       classes without rewriting every element's class string. */
+    [data-theme="dark"] { color-scheme: dark; }
+    [data-theme="dark"] body            { background: rgb(15 23 42); color: rgb(241 245 249); }
+    [data-theme="dark"] .bg-white       { background-color: rgb(30 41 59); }
+    [data-theme="dark"] .bg-slate-50    { background-color: rgb(15 23 42); }
+    [data-theme="dark"] .bg-slate-100   { background-color: rgb(51 65 85 / 0.6); }
+    [data-theme="dark"] .bg-slate-200   { background-color: rgb(71 85 105); }
+    [data-theme="dark"] .border-slate-100 { border-color: rgb(30 41 59); }
+    [data-theme="dark"] .border-slate-200 { border-color: rgb(51 65 85); }
+    [data-theme="dark"] .border-slate-300 { border-color: rgb(71 85 105); }
+    [data-theme="dark"] .text-slate-900 { color: rgb(241 245 249); }
+    [data-theme="dark"] .text-slate-800 { color: rgb(226 232 240); }
+    [data-theme="dark"] .text-slate-700 { color: rgb(203 213 225); }
+    [data-theme="dark"] .text-slate-600 { color: rgb(148 163 184); }
+    [data-theme="dark"] .text-slate-500 { color: rgb(148 163 184); }
+    [data-theme="dark"] .text-slate-400 { color: rgb(100 116 139); }
+    [data-theme="dark"] .hover\:bg-slate-50:hover  { background-color: rgb(51 65 85 / 0.6); }
+    [data-theme="dark"] .hover\:bg-slate-200:hover { background-color: rgb(71 85 105); }
+    [data-theme="dark"] .focus\:bg-white:focus     { background-color: rgb(30 41 59); }
+    [data-theme="dark"] input,
+    [data-theme="dark"] [type="search"] { background-color: rgb(51 65 85 / 0.6); color: rgb(241 245 249); }
+    [data-theme="dark"] .bg-blue-50    { background-color: rgb(30 58 138 / 0.4); }
+    [data-theme="dark"] .bg-amber-50   { background-color: rgb(120 53 15 / 0.4); }
+    [data-theme="dark"] .bg-red-50     { background-color: rgb(127 29 29 / 0.4); }
+    [data-theme="dark"] .bg-emerald-50 { background-color: rgb(6 78 59 / 0.4); }
+    [data-theme="dark"] .bg-fuchsia-50 { background-color: rgb(112 26 117 / 0.4); }
+    [data-theme="dark"] .bg-indigo-50  { background-color: rgb(49 46 129 / 0.4); }
+    [data-theme="dark"] .bg-indigo-100 { background-color: rgb(67 56 202 / 0.5); }
+    [data-theme="dark"] .text-blue-700    { color: rgb(147 197 253); }
+    [data-theme="dark"] .text-amber-700   { color: rgb(252 211 77); }
+    [data-theme="dark"] .text-red-700     { color: rgb(252 165 165); }
+    [data-theme="dark"] .text-emerald-700 { color: rgb(110 231 183); }
+    [data-theme="dark"] .text-fuchsia-800 { color: rgb(232 121 249); }
+    [data-theme="dark"] .text-indigo-700  { color: rgb(165 180 252); }
+    [data-theme="dark"] .border-emerald-200 { border-color: rgb(6 78 59); }
+    [data-theme="dark"] .border-red-200     { border-color: rgb(127 29 29); }
+    [data-theme="dark"] .border-amber-200   { border-color: rgb(120 53 15); }
+    [data-theme="dark"] .border-fuchsia-400 { border-color: rgb(192 38 211); }
+    [data-theme="dark"] .scrollbar-thin::-webkit-scrollbar-thumb { background: #475569; }
+    /* Severity dot bg-* badges keep their bright fills — they need to pop in either theme. */
   </style>
 </head>
 <body class="bg-slate-50 text-slate-900 min-h-screen">
@@ -36,11 +79,30 @@
           <span id="poll-dot" class="inline-block w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>
           <span class="text-xs">live</span>
         </div>
+        <button id="theme-toggle"
+                class="p-1.5 rounded-md hover:bg-slate-100 text-slate-500"
+                title="Toggle dark mode">
+          <span id="theme-icon" class="text-base leading-none">🌙</span>
+        </button>
       </div>
     </div>
 
-    <!-- Filter row -->
-    <div class="max-w-7xl mx-auto px-6 pb-3 flex flex-wrap items-center gap-3 text-sm">
+    <!-- Tab navigation -->
+    <div class="border-t border-slate-100">
+      <nav class="max-w-7xl mx-auto px-6 flex gap-1 text-sm">
+        <button data-tab="markets"
+                class="tab-btn py-2.5 px-4 -mb-px border-b-2 border-blue-500 text-slate-900 font-medium">
+          Markets
+        </button>
+        <button data-tab="behavior"
+                class="tab-btn py-2.5 px-4 -mb-px border-b-2 border-transparent text-slate-500 hover:text-slate-700">
+          Behavior
+        </button>
+      </nav>
+    </div>
+
+    <!-- Filter row (Markets tab) -->
+    <div data-pane="markets" class="max-w-7xl mx-auto px-6 pb-3 pt-3 flex flex-wrap items-center gap-3 text-sm">
       <span class="text-slate-500 font-medium">Severity:</span>
       <div id="severity-chips" class="flex gap-2"></div>
       <span class="text-slate-300">|</span>
@@ -60,7 +122,7 @@
   </header>
 
   <!-- Live Tier banner (top critical/high unreviewed originals) -->
-  <div id="live-tier-wrap" class="max-w-7xl mx-auto px-6 pt-4 hidden">
+  <div id="live-tier-wrap" data-pane="markets" class="max-w-7xl mx-auto px-6 pt-4 hidden">
     <div class="rounded-lg p-3 bg-gradient-to-r from-fuchsia-600 via-red-600 to-amber-500 shadow-md">
       <div class="flex items-center justify-between mb-2">
         <span class="text-xs font-bold uppercase tracking-widest text-white">⚡ Live tier · unreviewed top signals</span>
@@ -70,8 +132,8 @@
     </div>
   </div>
 
-  <!-- Time-series chart -->
-  <div class="max-w-7xl mx-auto px-6 pt-4">
+  <!-- Time-series chart (Markets tab) -->
+  <div data-pane="markets" class="max-w-7xl mx-auto px-6 pt-4">
     <div class="bg-white border border-slate-200 rounded-lg p-3">
       <div class="flex items-center justify-between mb-2">
         <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">Last 24h · severity by hour</span>
@@ -83,8 +145,8 @@
     </div>
   </div>
 
-  <!-- Main two-column layout -->
-  <main class="max-w-7xl mx-auto px-6 py-4 grid grid-cols-1 lg:grid-cols-5 gap-6">
+  <!-- Main two-column layout (Markets tab) -->
+  <main data-pane="markets" class="max-w-7xl mx-auto px-6 py-4 grid grid-cols-1 lg:grid-cols-5 gap-6">
 
     <!-- Feed (originals only) -->
     <section class="lg:col-span-3">
@@ -113,6 +175,63 @@
       </div>
     </aside>
   </main>
+
+  <!-- ===================== Behavior tab ===================== -->
+  <section data-pane="behavior" class="hidden max-w-7xl mx-auto px-6 py-6">
+    <div class="flex items-center justify-between mb-4 flex-wrap gap-3">
+      <div>
+        <h2 class="text-lg font-bold">Behavioral Forecast</h2>
+        <p class="text-xs text-slate-500">Pattern analysis of recent original posts. Generated on demand by Claude.</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <span id="behavior-meta" class="text-xs text-slate-500"></span>
+        <button id="behavior-refresh"
+                class="px-3 py-1.5 rounded bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-wait">
+          Refresh
+        </button>
+      </div>
+    </div>
+
+    <div id="behavior-loading" class="hidden text-center py-12 text-slate-500 text-sm">
+      <div class="inline-block w-6 h-6 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+      <div class="mt-2">Generating analysis…</div>
+    </div>
+
+    <div id="behavior-empty" class="hidden text-center py-12 text-slate-500 text-sm">
+      No analysis yet. Click <strong>Refresh</strong> to generate one. Each generation is a single Claude call (~$0.02–0.05).
+    </div>
+
+    <div id="behavior-error" class="hidden bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm mb-4"></div>
+
+    <div id="behavior-content" class="hidden space-y-6">
+      <!-- Mood + summary -->
+      <div class="bg-white rounded-lg p-4 border border-slate-200">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs uppercase tracking-wide text-slate-500 font-semibold">Current mood</span>
+          <span id="b-mood" class="text-sm font-bold text-fuchsia-700"></span>
+        </div>
+        <p id="b-summary" class="text-sm text-slate-800 leading-relaxed"></p>
+      </div>
+
+      <!-- Active themes -->
+      <div>
+        <h3 class="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Active themes</h3>
+        <div id="b-themes" class="grid grid-cols-1 md:grid-cols-2 gap-2"></div>
+      </div>
+
+      <!-- Predictions -->
+      <div>
+        <h3 class="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Predictions</h3>
+        <div id="b-predictions" class="space-y-2"></div>
+      </div>
+
+      <!-- Trigger watchlist -->
+      <div>
+        <h3 class="text-xs uppercase tracking-wide text-slate-500 font-semibold mb-2">Trigger watchlist</h3>
+        <div id="b-triggers" class="space-y-2"></div>
+      </div>
+    </div>
+  </section>
 
 <script>
 'use strict';
@@ -738,6 +857,216 @@ setInterval(() => {
     if (iso) el.textContent = relativeTime(iso);
   }
 }, 30000);
+
+// -----------------------------------------------------------------------------
+// Theme toggle (light / dark)
+// -----------------------------------------------------------------------------
+const THEME_KEY = 'trumptruths.theme.v1';
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  document.getElementById('theme-icon').textContent = theme === 'dark' ? '☀️' : '🌙';
+}
+
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (_) {}
+  if (!saved) {
+    saved = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+  applyTheme(saved);
+})();
+
+document.getElementById('theme-toggle').onclick = () => {
+  const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch (_) {}
+  // Chart text colors are baked-in; nudge it to re-render with current theme.
+  if (state.chart) { state.chart.update(); }
+};
+
+// -----------------------------------------------------------------------------
+// Tabs (Markets / Behavior)
+// -----------------------------------------------------------------------------
+const TAB_KEY = 'trumptruths.tab.v1';
+
+function showTab(name) {
+  for (const btn of document.querySelectorAll('.tab-btn')) {
+    const active = btn.dataset.tab === name;
+    btn.classList.toggle('border-blue-500', active);
+    btn.classList.toggle('border-transparent', !active);
+    btn.classList.toggle('text-slate-900', active);
+    btn.classList.toggle('font-medium', active);
+    btn.classList.toggle('text-slate-500', !active);
+  }
+  for (const el of document.querySelectorAll('[data-pane]')) {
+    el.classList.toggle('hidden', el.dataset.pane !== name);
+  }
+  try { localStorage.setItem(TAB_KEY, name); } catch (_) {}
+  // First time the Behavior tab is opened, hint at empty state if no cache yet.
+  if (name === 'behavior') ensureBehaviorLoaded();
+}
+
+for (const btn of document.querySelectorAll('.tab-btn')) {
+  btn.onclick = () => showTab(btn.dataset.tab);
+}
+
+// -----------------------------------------------------------------------------
+// Behavior tab fetch / render
+// -----------------------------------------------------------------------------
+const behaviorState = { loaded: false, loading: false, data: null };
+
+async function fetchBehavior(force = false) {
+  if (behaviorState.loading) return;
+  behaviorState.loading = true;
+  document.getElementById('behavior-refresh').disabled = true;
+  document.getElementById('behavior-loading').classList.remove('hidden');
+  document.getElementById('behavior-empty').classList.add('hidden');
+  document.getElementById('behavior-error').classList.add('hidden');
+  document.getElementById('behavior-content').classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/behavior' + (force ? '?force=1' : ''));
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    behaviorState.data = data;
+    behaviorState.loaded = true;
+    renderBehavior(data);
+  } catch (err) {
+    const errEl = document.getElementById('behavior-error');
+    errEl.textContent = `Failed to load behavior analysis: ${err.message || err}`;
+    errEl.classList.remove('hidden');
+  } finally {
+    behaviorState.loading = false;
+    document.getElementById('behavior-refresh').disabled = false;
+    document.getElementById('behavior-loading').classList.add('hidden');
+  }
+}
+
+function ensureBehaviorLoaded() {
+  if (behaviorState.loaded || behaviorState.loading) return;
+  // Cache-only probe: never triggers a paid generation. If no cache exists,
+  // server returns 204 and we show the empty state with a Refresh prompt.
+  fetch('/api/behavior?cache_only=1').then(async (res) => {
+    if (res.status === 204) {
+      document.getElementById('behavior-empty').classList.remove('hidden');
+      return;
+    }
+    if (!res.ok) {
+      const errEl = document.getElementById('behavior-error');
+      errEl.textContent = `Failed to load cache: HTTP ${res.status}`;
+      errEl.classList.remove('hidden');
+      return;
+    }
+    const data = await res.json();
+    behaviorState.data = data;
+    behaviorState.loaded = true;
+    renderBehavior(data);
+  }).catch((err) => {
+    const errEl = document.getElementById('behavior-error');
+    errEl.textContent = `Failed to load cache: ${err.message || err}`;
+    errEl.classList.remove('hidden');
+  });
+}
+
+const SEVERITY_FOR_INTENSITY = { low: 'low', medium: 'medium', high: 'high' };
+const TRAJECTORY_SYM = { rising: '↗', stable: '→', cooling: '↘' };
+const CONFIDENCE_COLOR = {
+  low:    'bg-slate-100 text-slate-600',
+  medium: 'bg-blue-50 text-blue-700',
+  high:   'bg-emerald-50 text-emerald-700',
+};
+
+function renderBehavior(payload) {
+  const r = payload.result || {};
+  document.getElementById('behavior-content').classList.remove('hidden');
+  document.getElementById('behavior-empty').classList.add('hidden');
+
+  document.getElementById('b-mood').textContent = r.current_mood || '—';
+  document.getElementById('b-summary').textContent = r.summary || '—';
+
+  // Themes
+  const themesEl = document.getElementById('b-themes');
+  const themes = r.active_themes || [];
+  if (themes.length === 0) {
+    themesEl.innerHTML = `<div class="text-xs text-slate-400 italic col-span-full">No active themes detected.</div>`;
+  } else {
+    themesEl.innerHTML = themes.map((t) => {
+      const sev = SEVERITY_FOR_INTENSITY[t.intensity] || 'none';
+      const c = SEV_COLOR[sev] || SEV_COLOR.none;
+      const traj = TRAJECTORY_SYM[t.trajectory] || '';
+      return `
+        <div class="rounded-lg border border-slate-200 ${c.bg} p-3">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-sm font-semibold ${c.text}">${escapeHtml(t.label || t.theme || '?')}</span>
+            <span class="text-xs ${c.text} font-mono">${escapeHtml(t.intensity || '?')} ${traj}</span>
+          </div>
+          <div class="text-[11px] text-slate-500 mb-1">
+            ${t.post_count ?? '?'} posts · first seen ${t.first_seen_hours_ago != null ? Number(t.first_seen_hours_ago).toFixed(0) + 'h ago' : '—'}
+          </div>
+          <p class="text-xs text-slate-700 leading-relaxed">${escapeHtml(t.evidence || '')}</p>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // Predictions
+  const predEl = document.getElementById('b-predictions');
+  const preds = r.predictions || [];
+  if (preds.length === 0) {
+    predEl.innerHTML = `<div class="text-xs text-slate-400 italic">No predictions.</div>`;
+  } else {
+    predEl.innerHTML = preds.map((p) => {
+      const conf = (p.confidence || 'low').toLowerCase();
+      const confClass = CONFIDENCE_COLOR[conf] || CONFIDENCE_COLOR.low;
+      return `
+        <div class="rounded-lg border border-slate-200 bg-white p-3">
+          <div class="flex items-center gap-2 mb-1.5 flex-wrap">
+            <span class="px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 text-[10px] font-mono uppercase">${escapeHtml(p.horizon || '?')}</span>
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${confClass}">${escapeHtml(conf)} confidence</span>
+          </div>
+          <div class="text-sm text-slate-800 font-medium mb-1">${escapeHtml(p.prediction || '')}</div>
+          <div class="text-xs text-slate-600 mb-1.5"><span class="text-slate-400">why:</span> ${escapeHtml(p.rationale || '')}</div>
+          <div class="text-xs text-slate-600"><span class="text-slate-400">watch for:</span> ${escapeHtml(p.what_to_watch_for || '')}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // Triggers
+  const trigEl = document.getElementById('b-triggers');
+  const trigs = r.trigger_watchlist || [];
+  if (trigs.length === 0) {
+    trigEl.innerHTML = `<div class="text-xs text-slate-400 italic">No trigger watchlist.</div>`;
+  } else {
+    trigEl.innerHTML = trigs.map((t) => `
+      <div class="rounded-lg border border-amber-200 bg-amber-50 p-3">
+        <div class="text-sm text-amber-900 font-medium mb-1">If: ${escapeHtml(t.trigger || '')}</div>
+        <div class="text-xs text-amber-800 mb-1"><span class="text-amber-600">expect:</span> ${escapeHtml(t.expected_response || '')}</div>
+        <div class="text-[11px] text-amber-700 font-mono">within ~${t.response_window_hours ?? '?'}h</div>
+      </div>
+    `).join('');
+  }
+
+  // Meta line
+  const meta = document.getElementById('behavior-meta');
+  const gen = payload.generated_at;
+  const age = gen ? relativeTime(gen) : '—';
+  const cacheTag = payload.from_cache ? ' (cached)' : ' (fresh)';
+  meta.textContent = `${payload.input_post_count ?? 0} posts · last ${payload.input_window_hours ?? '?'}h · generated ${age}${cacheTag}`;
+}
+
+document.getElementById('behavior-refresh').onclick = () => fetchBehavior(true);
+
+// Restore last-active tab on load
+(function initTab() {
+  let saved = 'markets';
+  try { saved = localStorage.getItem(TAB_KEY) || 'markets'; } catch (_) {}
+  showTab(saved);
+})();
 
 // -----------------------------------------------------------------------------
 // Init
