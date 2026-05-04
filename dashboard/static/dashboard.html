@@ -59,6 +59,17 @@
     </div>
   </header>
 
+  <!-- Live Tier banner (top critical/high unreviewed originals) -->
+  <div id="live-tier-wrap" class="max-w-7xl mx-auto px-6 pt-4 hidden">
+    <div class="rounded-lg p-3 bg-gradient-to-r from-fuchsia-600 via-red-600 to-amber-500 shadow-md">
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-bold uppercase tracking-widest text-white">⚡ Live tier · unreviewed top signals</span>
+        <span id="live-tier-count" class="text-xs text-white/80 font-mono"></span>
+      </div>
+      <div id="live-tier" class="grid grid-cols-1 md:grid-cols-3 gap-2"></div>
+    </div>
+  </div>
+
   <!-- Time-series chart -->
   <div class="max-w-7xl mx-auto px-6 pt-4">
     <div class="bg-white border border-slate-200 rounded-lg p-3">
@@ -75,12 +86,21 @@
   <!-- Main two-column layout -->
   <main class="max-w-7xl mx-auto px-6 py-4 grid grid-cols-1 lg:grid-cols-5 gap-6">
 
-    <!-- Feed -->
+    <!-- Feed (originals only) -->
     <section class="lg:col-span-3">
       <div id="feed" class="space-y-2 max-h-[calc(100vh-260px)] overflow-y-auto pr-2 scrollbar-thin"></div>
       <div id="feed-empty" class="hidden text-center text-slate-500 text-sm py-12">
         No posts match the current filters.
       </div>
+
+      <!-- News reshares accordion (link_share posts) -->
+      <details id="reshares-accordion" class="mt-4 bg-white border border-slate-200 rounded-lg">
+        <summary class="cursor-pointer px-4 py-2 text-xs font-semibold uppercase tracking-wide text-slate-500 hover:bg-slate-50 select-none flex items-center justify-between">
+          <span>📰 News reshares <span id="reshares-count" class="text-slate-400 font-mono ml-1">(0)</span></span>
+          <span class="text-slate-400 text-[11px] font-normal normal-case tracking-normal">low-priority headline shares · click to expand</span>
+        </summary>
+        <div id="reshares-list" class="px-3 pb-3 pt-1 space-y-2 max-h-[60vh] overflow-y-auto scrollbar-thin"></div>
+      </details>
     </section>
 
     <!-- Detail panel -->
@@ -287,68 +307,74 @@ function passesFilters(post) {
 // -----------------------------------------------------------------------------
 // Feed rendering
 // -----------------------------------------------------------------------------
-function renderFeed() {
-  const feed = document.getElementById('feed');
-  const empty = document.getElementById('feed-empty');
-  const filtered = state.posts.filter(passesFilters);
+function isLinkShare(p) {
+  return (p.analysis || {}).post_kind === 'link_share';
+}
 
-  if (filtered.length === 0) {
-    feed.innerHTML = '';
-    empty.classList.remove('hidden');
-    return;
-  }
-  empty.classList.add('hidden');
+function isLiveTierCandidate(p) {
+  const a = p.analysis || {};
+  const sev = a.severity || 'none';
+  const kind = a.post_kind || 'original';   // tolerate legacy records w/ no post_kind
+  if (kind !== 'original') return false;
+  if (sev !== 'critical' && sev !== 'high') return false;
+  if (state.reviewed.has(p.post_id)) return false;
+  return true;
+}
 
-  feed.innerHTML = filtered.map((p) => {
-    const a = p.analysis || {};
-    const sev = a.severity || 'none';
-    const c = SEV_COLOR[sev] || SEV_COLOR.none;
-    const isSelected = p.post_id === state.selectedId;
-    const isReviewed = state.reviewed.has(p.post_id);
-    const excerpt = (p.content || '').slice(0, 200) + ((p.content || '').length > 200 ? '…' : '');
-    const nonNeutralAssets = ASSETS.filter((asset) => {
-      const dir = (a[asset] || {}).direction;
-      return dir && dir !== 'neutral';
-    });
-    const assetChips = nonNeutralAssets.map((asset) => {
-      const dir = (a[asset] || {}).direction;
-      const dc = DIR_COLOR[dir] || DIR_COLOR.neutral;
-      return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs ${dc.bg} ${dc.text} border ${dc.border}">
-        <span>${dc.sym}</span><span>${ASSET_LABELS[asset]}</span>
-      </span>`;
-    }).join('');
-    const relatedCount = (p.related_posts || []).length;
-    const relatedBadge = relatedCount > 0
-      ? `<span class="inline-block px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 text-[10px] font-semibold">+${relatedCount} related</span>`
-      : '';
-    const isCritical = sev === 'critical';
-    const reviewedClass = isReviewed ? 'opacity-50' : '';
-
-    return `
-      <button data-post-id="${p.post_id}"
-        class="block w-full text-left bg-white rounded-lg border border-slate-200 p-4 hover:border-slate-300 transition ${reviewedClass}
-               ${isSelected ? 'border-l-4 !border-l-indigo-500 ring-1 ring-indigo-100' : ''}
-               ${isCritical ? 'pulse-critical' : ''}">
-        <div class="flex items-start justify-between gap-3 mb-2">
-          <div class="flex items-center gap-2 flex-wrap">
-            <span class="inline-block w-2 h-2 rounded-full ${c.badge}"></span>
-            <span class="text-xs font-semibold uppercase tracking-wide ${c.text}">${sev}</span>
-            <span class="text-xs text-slate-400">·</span>
-            <span class="text-xs text-slate-500" data-rel="${p.analyzed_at || ''}">${relativeTime(p.analyzed_at)}</span>
-            ${relatedBadge}
-            ${a.topic_signature && a.topic_signature !== 'none'
-                ? `<span class="text-[10px] font-mono text-slate-400">${escapeHtml(a.topic_signature)}</span>`
-                : ''}
-          </div>
-          <span class="text-xs text-slate-400 font-mono">#${p.post_id || '?'}</span>
-        </div>
-        <p class="text-sm text-slate-700 leading-relaxed mb-2">${escapeHtml(excerpt)}</p>
-        ${assetChips ? `<div class="flex flex-wrap gap-1 mt-2">${assetChips}</div>` : ''}
-      </button>
-    `;
+function postCardHtml(p, { compact = false } = {}) {
+  const a = p.analysis || {};
+  const sev = a.severity || 'none';
+  const c = SEV_COLOR[sev] || SEV_COLOR.none;
+  const isSelected = p.post_id === state.selectedId;
+  const isReviewed = state.reviewed.has(p.post_id);
+  const excerptLen = compact ? 140 : 200;
+  const excerpt = (p.content || '').slice(0, excerptLen) + ((p.content || '').length > excerptLen ? '…' : '');
+  const nonNeutralAssets = ASSETS.filter((asset) => {
+    const dir = (a[asset] || {}).direction;
+    return dir && dir !== 'neutral';
+  });
+  const assetChips = nonNeutralAssets.map((asset) => {
+    const dir = (a[asset] || {}).direction;
+    const dc = DIR_COLOR[dir] || DIR_COLOR.neutral;
+    return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] ${dc.bg} ${dc.text} border ${dc.border}">
+      <span>${dc.sym}</span><span>${ASSET_LABELS[asset]}</span>
+    </span>`;
   }).join('');
+  const relatedCount = (p.related_posts || []).length;
+  const relatedBadge = relatedCount > 0
+    ? `<span class="inline-block px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 text-[10px] font-semibold">+${relatedCount} related</span>`
+    : '';
+  const isCritical = sev === 'critical';
+  const reviewedClass = isReviewed ? 'opacity-50' : '';
+  const padding = compact ? 'p-3' : 'p-4';
+  const bg = compact ? 'bg-white/95' : 'bg-white';
 
-  for (const btn of feed.querySelectorAll('[data-post-id]')) {
+  return `
+    <button data-post-id="${p.post_id}"
+      class="block w-full text-left ${bg} rounded-lg border border-slate-200 ${padding} hover:border-slate-300 transition ${reviewedClass}
+             ${isSelected ? 'border-l-4 !border-l-indigo-500 ring-1 ring-indigo-100' : ''}
+             ${isCritical ? 'pulse-critical' : ''}">
+      <div class="flex items-start justify-between gap-2 mb-1.5">
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <span class="inline-block w-2 h-2 rounded-full ${c.badge}"></span>
+          <span class="text-xs font-semibold uppercase tracking-wide ${c.text}">${sev}</span>
+          <span class="text-xs text-slate-400">·</span>
+          <span class="text-xs text-slate-500" data-rel="${p.analyzed_at || ''}">${relativeTime(p.analyzed_at)}</span>
+          ${relatedBadge}
+          ${a.topic_signature && a.topic_signature !== 'none'
+              ? `<span class="text-[10px] font-mono text-slate-400">${escapeHtml(a.topic_signature)}</span>`
+              : ''}
+        </div>
+        <span class="text-[10px] text-slate-400 font-mono">#${p.post_id || '?'}</span>
+      </div>
+      <p class="${compact ? 'text-xs' : 'text-sm'} text-slate-700 leading-relaxed mb-1.5">${escapeHtml(excerpt)}</p>
+      ${assetChips ? `<div class="flex flex-wrap gap-1 mt-1.5">${assetChips}</div>` : ''}
+    </button>
+  `;
+}
+
+function wireCardClicks(rootEl) {
+  for (const btn of rootEl.querySelectorAll('[data-post-id]')) {
     btn.onclick = () => {
       state.selectedId = btn.getAttribute('data-post-id');
       try { localStorage.setItem(SELECTED_KEY, state.selectedId); } catch (_) {}
@@ -356,6 +382,65 @@ function renderFeed() {
       renderDetail();
     };
   }
+}
+
+function renderLiveTier() {
+  const wrap = document.getElementById('live-tier-wrap');
+  const grid = document.getElementById('live-tier');
+  const countEl = document.getElementById('live-tier-count');
+
+  // Live Tier ignores severity/asset/search filters — always surfaces the top
+  // unreviewed critical/high originals regardless of how the user has the
+  // main feed filtered. The whole point is "do not let me miss this."
+  const candidates = state.posts.filter(isLiveTierCandidate).slice(0, 3);
+
+  if (candidates.length === 0) {
+    wrap.classList.add('hidden');
+    return;
+  }
+  wrap.classList.remove('hidden');
+  countEl.textContent = `top ${candidates.length}`;
+  grid.innerHTML = candidates.map((p) => postCardHtml(p, { compact: true })).join('');
+  wireCardClicks(grid);
+}
+
+function renderMainFeed() {
+  const feed = document.getElementById('feed');
+  const empty = document.getElementById('feed-empty');
+  const mainPosts = state.posts
+    .filter((p) => !isLinkShare(p))
+    .filter(passesFilters);
+
+  if (mainPosts.length === 0) {
+    feed.innerHTML = '';
+    empty.classList.remove('hidden');
+  } else {
+    empty.classList.add('hidden');
+    feed.innerHTML = mainPosts.map((p) => postCardHtml(p)).join('');
+    wireCardClicks(feed);
+  }
+}
+
+function renderReshares() {
+  const list = document.getElementById('reshares-list');
+  const countEl = document.getElementById('reshares-count');
+  const reshares = state.posts
+    .filter(isLinkShare)
+    .filter(passesFilters);
+
+  countEl.textContent = `(${reshares.length})`;
+  if (reshares.length === 0) {
+    list.innerHTML = `<div class="text-xs text-slate-400 italic py-2">No reshares match the current filters.</div>`;
+    return;
+  }
+  list.innerHTML = reshares.map((p) => postCardHtml(p, { compact: true })).join('');
+  wireCardClicks(list);
+}
+
+function renderFeed() {
+  renderLiveTier();
+  renderMainFeed();
+  renderReshares();
 }
 
 function escapeHtml(s) {
