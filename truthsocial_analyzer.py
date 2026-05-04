@@ -23,15 +23,32 @@ CLAUDE_MODEL = "claude-sonnet-4-6"
 # this many hours gets folded under the existing parent record.
 DEDUP_WINDOW_HOURS = 12
 
+# Staleness thresholds (post age, measured from the post's original timestamp):
+# - >24h: severity is clamped to "low" (markets have absorbed the signal).
+# - >48h: skip Claude analysis entirely; the post is filed as seen but no
+#         record is created. Critical for cold-start: the RSS feed contains
+#         the last 100 entries spanning multiple days, and we don't want to
+#         pay to re-rate posts that are already historical.
+STALE_SEVERITY_CAP_HOURS = 24
+STALE_SKIP_HOURS = 48
+
 # Severity rank — used for clamping link_share severity and for UI sorting.
 SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 SYSTEM_PROMPT = """You are an expert financial markets analyst.
 Analyze the following social media post for potential market impact across major asset classes.
 
-You will receive a `post_kind` hint along with the post body. Use it to calibrate severity:
+You will receive `post_kind` and `age_hours` hints along with the post body. Use them to calibrate severity:
+
+post_kind:
 - `post_kind=original`  — Trump's own first-person words on TruthSocial. Severity is uncapped; calibrate to actual content. Original first-person commitments are the highest-priority signal in this feed.
 - `post_kind=link_share` — Trump shared a media headline / URL with little or no original commentary. You may be given the fetched article body for context. The information is public and likely already priced in. **Severity must not exceed `low`.** Use `none` unless the article reveals an imminent, concrete, not-yet-priced-in policy commitment.
+
+age_hours (how long ago the post was originally published):
+- < 6h:    fresh; full severity range available.
+- 6-12h:   recent; full range, but flag if you suspect the news has already broken on wires.
+- 12-24h:  stale-ish; reduce confidence by one tier unless the post mentions an action with future timing ("Monday", "next week").
+- > 24h:   stale. **Severity must not exceed `low`** — the market has already digested this. Code will enforce this clamp anyway.
 
 Respond with ONLY a valid JSON object — no markdown fences, no preamble — matching this exact schema:
 
@@ -217,6 +234,33 @@ class TruthSocialAnalyzer:
         return None
     
     @staticmethod
+    def parse_timestamp(ts: Optional[str]) -> Optional[datetime]:
+        """Parse an ISO timestamp string to a tz-aware UTC datetime. None on failure."""
+        if not ts:
+            return None
+        try:
+            # feedparser sometimes hands back a "Tue, 14 Oct 2025 05:36:58 +0000" style
+            # string; try ISO first, fall back to email/RFC2822 parsing.
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(ts)
+            except (TypeError, ValueError):
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    @classmethod
+    def post_age_hours(cls, ts: Optional[str]) -> Optional[float]:
+        """Return age in hours of a post given its timestamp string. None if unparseable."""
+        dt = cls.parse_timestamp(ts)
+        if dt is None:
+            return None
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+    @staticmethod
     def classify_post_kind(post_content: str) -> str:
         """Classify a TruthSocial post as original / link_share.
 
@@ -268,7 +312,9 @@ class TruthSocialAnalyzer:
             return None
         return text[:max_chars]
 
-    def analyze_post_with_claude(self, post_content: str) -> Optional[Dict]:
+    def analyze_post_with_claude(
+        self, post_content: str, age_hours: Optional[float] = None
+    ) -> Optional[Dict]:
         """Analyze post using Claude. Returns parsed JSON dict or None on failure."""
         if not self.claude_client:
             logger.error("Claude client not initialized")
@@ -287,10 +333,11 @@ class TruthSocialAnalyzer:
                     article_block = f"\n\n--- Fetched article body (truncated to 4k chars) ---\n{article}\n--- end article ---"
                     logger.info(f"Fetched article body ({len(article)} chars) from {url}")
 
-        user_message = f"post_kind={post_kind}\n\n{post_content}{article_block}"
+        age_hint = f"{age_hours:.1f}" if age_hours is not None else "unknown"
+        user_message = f"post_kind={post_kind}\nage_hours={age_hint}\n\n{post_content}{article_block}"
 
         try:
-            logger.info(f"Analyzing post with Claude (kind={post_kind})...")
+            logger.info(f"Analyzing post with Claude (kind={post_kind}, age={age_hint}h)...")
             response = self.claude_client.messages.create(
                 model=self.model,
                 max_tokens=2000,
@@ -311,6 +358,18 @@ class TruthSocialAnalyzer:
                 sev = parsed.get("severity", "none")
                 if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK["low"]:
                     logger.info(f"Clamping link_share severity {sev} -> low")
+                    parsed["severity"] = "low"
+
+            # Clamp severity for stale posts: > STALE_SEVERITY_CAP_HOURS old
+            # gets capped at "low" regardless of what Claude said. Markets
+            # have already absorbed the signal.
+            if age_hours is not None and age_hours > STALE_SEVERITY_CAP_HOURS:
+                sev = parsed.get("severity", "none")
+                if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK["low"]:
+                    logger.info(
+                        f"Clamping stale-post severity {sev} -> low "
+                        f"(age={age_hours:.1f}h > {STALE_SEVERITY_CAP_HOURS}h)"
+                    )
                     parsed["severity"] = "low"
 
             parsed["post_kind"] = post_kind
@@ -387,18 +446,28 @@ class TruthSocialAnalyzer:
         logger.info(f"Starting TruthSocial Analyzer")
         logger.info(f"RSS Feed: {self.rss_url}")
         logger.info(f"Checking for new posts every {interval} seconds")
-        
+
+        # One-time housekeeping at startup: demote any existing records whose
+        # post timestamps have aged past the cap thresholds while we were off.
+        demoted = self.demote_stale_records()
+        if demoted:
+            logger.info(f"Startup housekeeping: demoted {demoted} stale record(s).")
+
         try:
             while True:
+                # Before checking for new posts, age out anything that crossed
+                # the staleness threshold since the last poll.
+                self.demote_stale_records()
+
                 new_posts = self.check_for_new_posts()
-                
+
                 if new_posts:
                     logger.info(f"Found {len(new_posts)} new post(s)")
                     for post in new_posts:
                         self.handle_new_post(post)
                 else:
                     logger.info("No new posts found")
-                
+
                 logger.info(f"Waiting {interval} seconds before next check...")
                 time.sleep(interval)
                 
@@ -410,19 +479,56 @@ class TruthSocialAnalyzer:
             self.save_seen_posts()
             self.save_analyses()
     
+    def demote_stale_records(self) -> int:
+        """Walk existing analyses and demote severity on records whose post
+        timestamp has aged past the staleness thresholds. Returns the number
+        of records modified. Called every poll cycle so the dashboard's
+        severity ratings stay current with post age.
+        """
+        modified = 0
+        for record in self.analyses:
+            age = self.post_age_hours(record.get("timestamp"))
+            if age is None:
+                continue
+            analysis = record.get("analysis") or {}
+            sev = analysis.get("severity", "none")
+            if age > STALE_SEVERITY_CAP_HOURS and SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK["low"]:
+                analysis["severity"] = "low"
+                record["analysis"] = analysis
+                modified += 1
+                logger.info(
+                    f"Demoted stale record #{record.get('post_id')} {sev} -> low "
+                    f"(age={age:.1f}h)"
+                )
+        if modified:
+            self.save_analyses()
+        return modified
+
     def handle_new_post(self, post: Dict):
         """Handle a new post - analyze, cluster by topic, persist."""
+        age = self.post_age_hours(post.get("timestamp"))
+        age_str = f"{age:.1f}h" if age is not None else "?"
+
+        # Skip ancient posts entirely. Saves the API call AND keeps cold-start
+        # cruft from polluting the dashboard.
+        if age is not None and age > STALE_SKIP_HOURS:
+            logger.info(
+                f"Skipping stale post #{post['id']} (age={age_str} > {STALE_SKIP_HOURS}h) — "
+                f"not analyzed, marked seen."
+            )
+            return
+
         print(f"\n{'='*80}")
         print(f"NEW POST FROM @realDonaldTrump")
         print(f"{'='*80}")
-        print(f"Time:    {post.get('timestamp', 'Unknown')}")
+        print(f"Time:    {post.get('timestamp', 'Unknown')}  (age={age_str})")
         print(f"Post ID: {post['id']}")
         print(f"URL:     {post['url']}")
         print(f"{'='*80}")
         print(post['text'][:500] + ("..." if len(post['text']) > 500 else ""))
         print(f"{'='*80}")
 
-        analysis = self.analyze_post_with_claude(post['text'])
+        analysis = self.analyze_post_with_claude(post['text'], age_hours=age)
 
         if not analysis:
             print(f"Analysis failed")
