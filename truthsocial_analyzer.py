@@ -9,27 +9,36 @@ import feedparser
 import time
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import re
 import os
+import httpx
 from dotenv import load_dotenv
 from anthropic import Anthropic
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
+# Topic-dedup window: a new post matching an existing topic_signature within
+# this many hours gets folded under the existing parent record.
+DEDUP_WINDOW_HOURS = 12
+
+# Severity rank — used for clamping link_share severity and for UI sorting.
+SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
 SYSTEM_PROMPT = """You are an expert financial markets analyst.
 Analyze the following social media post for potential market impact across major asset classes.
 
 You will receive a `post_kind` hint along with the post body. Use it to calibrate severity:
-- `post_kind=original`  — Trump's own first-person words. Severity is uncapped; calibrate to actual content.
-- `post_kind=link_share` — Trump shared a media headline / URL with little or no original commentary. The information is already public and most likely already priced in. **Severity must not exceed `low`.** Use `none` unless the underlying news represents an imminent, concrete policy commitment that markets have not yet absorbed.
+- `post_kind=original`  — Trump's own first-person words on TruthSocial. Severity is uncapped; calibrate to actual content. Original first-person commitments are the highest-priority signal in this feed.
+- `post_kind=link_share` — Trump shared a media headline / URL with little or no original commentary. You may be given the fetched article body for context. The information is public and likely already priced in. **Severity must not exceed `low`.** Use `none` unless the article reveals an imminent, concrete, not-yet-priced-in policy commitment.
 
 Respond with ONLY a valid JSON object — no markdown fences, no preamble — matching this exact schema:
 
 {
   "has_market_impact": <boolean>,
-  "severity": "none" | "low" | "medium" | "high",
+  "severity": "none" | "low" | "medium" | "high" | "critical",
+  "topic_signature": "<short-dash-separated-slug capturing the news cycle, e.g. 'iran-strait-hormuz' or 'china-tariffs-semis'. Use 'none' for posts with no market signal.>",
   "summary": "<1-2 sentence high-level take>",
   "equities":    {"direction": "positive|negative|neutral|uncertain", "sectors":    [<string>], "reasoning": "<string>"},
   "commodities": {"direction": "positive|negative|neutral|uncertain", "items":      [<string>], "reasoning": "<string>"},
@@ -39,10 +48,17 @@ Respond with ONLY a valid JSON object — no markdown fences, no preamble — ma
 }
 
 Severity calibration:
-- "none"   — no market signal at all (personal grievance, social commentary, reshared old news).
-- "low"    — vague rhetoric or already-priced-in information.
-- "medium" — concrete first-person policy direction with plausible near-term impact, but lacking specifics on timing/magnitude.
-- "high"   — clear, original, near-term, large-magnitude policy / trade / regulatory commitment. Reserved for first-person announcements with specific actions ("I am ordering X", "Effective Monday Y will happen", concrete tariff %, named sanctions, troop movements with dates, etc.). Reshared headlines never qualify.
+- "none"     — no market signal at all (personal grievance, social commentary, reshared old news).
+- "low"      — vague rhetoric or already-priced-in information.
+- "medium"   — concrete first-person policy direction with plausible near-term impact, but lacking specifics on timing/magnitude.
+- "high"     — clear, original, near-term, large-magnitude policy / trade / regulatory commitment with named parties and specific actions.
+- "critical" — Trump making a LIVE first-person commitment with specific dollar/percentage figures, named entities, AND a date or "effective immediately" trigger. Reserved for top-of-the-feed material: tariff announcements with rates, sanctions packages with targets, troop deployment orders with timelines, executive orders explicitly committed to. Must be `post_kind=original`. Reshared headlines NEVER qualify.
+
+Topic signature rules:
+- Use 3–5 lowercase dash-separated keywords that capture the news cycle, not the specific post wording.
+- Example: a post about "Trump orders strikes on Iranian shipping in Hormuz" and a follow-up "Iran's response on Strait shipping" should BOTH produce signature "iran-strait-hormuz".
+- Use the same signature when the underlying event is the same, even if the angle differs.
+- Use exactly "none" (no dashes) for posts with no market signal — these will not be clustered.
 
 Rules:
 - "direction" must be exactly one of the four lowercase values.
@@ -219,6 +235,39 @@ class TruthSocialAnalyzer:
             return "link_share"
         return "original"
 
+    @staticmethod
+    def extract_first_url(post_content: str) -> Optional[str]:
+        m = re.search(r'https?://\S+', post_content)
+        return m.group(0).rstrip('.,);]') if m else None
+
+    @staticmethod
+    def fetch_article_content(url: str, max_chars: int = 4000) -> Optional[str]:
+        """Best-effort fetch + strip of an article body. Returns text or None.
+
+        Polite UA, 5s timeout, naive HTML strip. Truncates to max_chars to
+        keep token cost bounded. Never raises — failure returns None.
+        """
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; TrumpTruths-Analyzer/1.0)"}
+            with httpx.Client(timeout=5.0, follow_redirects=True, headers=headers) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                html = resp.text
+        except Exception as e:
+            logger.warning(f"Article fetch failed for {url}: {e}")
+            return None
+
+        # Strip <script>/<style> blocks first
+        html = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        html = re.sub(r'<style[^>]*>.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        # Strip remaining tags
+        text = re.sub(r'<[^>]+>', ' ', html)
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text:
+            return None
+        return text[:max_chars]
+
     def analyze_post_with_claude(self, post_content: str) -> Optional[Dict]:
         """Analyze post using Claude. Returns parsed JSON dict or None on failure."""
         if not self.claude_client:
@@ -226,7 +275,19 @@ class TruthSocialAnalyzer:
             return None
 
         post_kind = self.classify_post_kind(post_content)
-        user_message = f"post_kind={post_kind}\n\n{post_content}"
+
+        # For link_share posts, fetch the article body so Claude has context
+        # beyond just the headline.
+        article_block = ""
+        if post_kind == "link_share":
+            url = self.extract_first_url(post_content)
+            if url:
+                article = self.fetch_article_content(url)
+                if article:
+                    article_block = f"\n\n--- Fetched article body (truncated to 4k chars) ---\n{article}\n--- end article ---"
+                    logger.info(f"Fetched article body ({len(article)} chars) from {url}")
+
+        user_message = f"post_kind={post_kind}\n\n{post_content}{article_block}"
 
         try:
             logger.info(f"Analyzing post with Claude (kind={post_kind})...")
@@ -243,7 +304,20 @@ class TruthSocialAnalyzer:
                 text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
             parsed = json.loads(text)
-            logger.info(f"Claude analysis completed (severity={parsed.get('severity', '?')})")
+
+            # Clamp link_share severity to "low" defensively even if Claude
+            # ignored the prompt. Original posts are uncapped.
+            if post_kind == "link_share":
+                sev = parsed.get("severity", "none")
+                if SEVERITY_RANK.get(sev, 0) > SEVERITY_RANK["low"]:
+                    logger.info(f"Clamping link_share severity {sev} -> low")
+                    parsed["severity"] = "low"
+
+            parsed["post_kind"] = post_kind
+            logger.info(
+                f"Claude analysis completed (severity={parsed.get('severity', '?')}, "
+                f"topic={parsed.get('topic_signature', '?')})"
+            )
             return parsed
 
         except json.JSONDecodeError as e:
@@ -253,6 +327,40 @@ class TruthSocialAnalyzer:
         except Exception as e:
             logger.error(f"Claude analysis failed: {e}")
             return None
+
+    @staticmethod
+    def normalize_topic(sig: Optional[str]) -> Optional[str]:
+        """Normalize a topic signature for matching: lowercase, sorted tokens."""
+        if not sig or sig == "none":
+            return None
+        tokens = sorted(t for t in re.split(r'[-_\s]+', sig.lower()) if t)
+        return "-".join(tokens) if tokens else None
+
+    def find_existing_cluster(self, topic_sig: Optional[str]) -> Optional[int]:
+        """Find the index of an existing analysis with the same topic within
+        the dedup window. Returns the index or None."""
+        norm_new = self.normalize_topic(topic_sig)
+        if not norm_new:
+            return None
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=DEDUP_WINDOW_HOURS)
+
+        for i, record in enumerate(self.analyses):
+            existing_sig = (record.get("analysis") or {}).get("topic_signature")
+            if self.normalize_topic(existing_sig) != norm_new:
+                continue
+            # Check recency
+            try:
+                analyzed_at = record.get("analyzed_at", "")
+                # Tolerate both naive and tz-aware ISO strings
+                ts = datetime.fromisoformat(analyzed_at)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts >= cutoff:
+                    return i
+            except (ValueError, TypeError):
+                continue
+        return None
     
     def check_for_new_posts(self) -> List[Dict]:
         """Check for new posts and return any new ones found"""
@@ -303,50 +411,72 @@ class TruthSocialAnalyzer:
             self.save_analyses()
     
     def handle_new_post(self, post: Dict):
-        """Handle a new post - analyze and display"""
+        """Handle a new post - analyze, cluster by topic, persist."""
         print(f"\n{'='*80}")
-        print(f"🆕 NEW POST FROM @realDonaldTrump")
+        print(f"NEW POST FROM @realDonaldTrump")
         print(f"{'='*80}")
-        print(f"📅 Time: {post.get('timestamp', 'Unknown')}")
-        print(f"🆔 Post ID: {post['id']}")
-        print(f"🔗 URL: {post['url']}")
-        print(f"⏰ Scraped: {post['scraped_at']}")
+        print(f"Time:    {post.get('timestamp', 'Unknown')}")
+        print(f"Post ID: {post['id']}")
+        print(f"URL:     {post['url']}")
         print(f"{'='*80}")
-        print(f"📝 CONTENT:")
+        print(post['text'][:500] + ("..." if len(post['text']) > 500 else ""))
         print(f"{'='*80}")
-        print(post['text'])
-        print(f"{'='*80}")
-        
-        # Analyze with Claude
+
         analysis = self.analyze_post_with_claude(post['text'])
 
-        if analysis:
-            print(f"🤖 CLAUDE MARKET ANALYSIS:")
-            print(f"{'='*80}")
-            print(json.dumps(analysis, indent=2))
-            print(f"{'='*80}")
+        if not analysis:
+            print(f"Analysis failed")
+            logger.info(f"New post processed (analysis failed) - ID: {post['id']}")
+            return
 
-            # Save analysis (Phase 3 schema)
-            analysis_data = {
-                'post_id': post['id'],
-                'timestamp': post.get('timestamp'),
-                'url': post.get('url'),
-                'content': post['text'],
-                'analyzed_at': datetime.now().isoformat(),
-                'model': self.model,
-                'analysis': analysis,
-            }
-            self.analyses.append(analysis_data)
-            self.save_analyses()
+        topic_sig = analysis.get("topic_signature")
+        cluster_idx = self.find_existing_cluster(topic_sig)
+        analyzed_at = datetime.now(timezone.utc).isoformat()
+
+        if cluster_idx is not None:
+            # Fold this post into an existing cluster.
+            parent = self.analyses[cluster_idx]
+            related = parent.setdefault("related_posts", [])
+            related.append({
+                "post_id": post["id"],
+                "timestamp": post.get("timestamp"),
+                "url": post.get("url"),
+                "content": post["text"],
+                "analyzed_at": analyzed_at,
+                "analysis": analysis,
+            })
+            # Bump parent's analyzed_at so it floats to top of feed.
+            parent["analyzed_at"] = analyzed_at
+            # Escalate severity if the new post is more severe than parent's.
+            new_sev = analysis.get("severity", "none")
+            old_sev = (parent.get("analysis") or {}).get("severity", "none")
+            if SEVERITY_RANK.get(new_sev, 0) > SEVERITY_RANK.get(old_sev, 0):
+                parent.setdefault("analysis", {})["severity"] = new_sev
+                logger.info(f"Cluster severity escalated {old_sev} -> {new_sev} (post {post['id']})")
+            print(f"Folded into existing cluster topic={topic_sig} ({len(related)} related)")
+            logger.info(
+                f"Post {post['id']} merged into cluster topic={topic_sig} "
+                f"(parent post_id={parent.get('post_id')}, related count={len(related)})"
+            )
         else:
-            print(f"❌ Analysis failed")
-        
-        print(f"📊 Total posts seen: {len(self.seen_posts)}")
-        print(f"📊 Total analyses: {len(self.analyses)}")
+            # New cluster (or non-clusterable post — topic_signature='none').
+            record = {
+                "post_id": post["id"],
+                "timestamp": post.get("timestamp"),
+                "url": post.get("url"),
+                "content": post["text"],
+                "analyzed_at": analyzed_at,
+                "model": self.model,
+                "analysis": analysis,
+                "related_posts": [],
+            }
+            self.analyses.append(record)
+            print(f"New record stored (severity={analysis.get('severity')}, topic={topic_sig})")
+            logger.info(f"Post {post['id']} stored as new record topic={topic_sig}")
+
+        self.save_analyses()
+        print(f"Total posts seen: {len(self.seen_posts)} | clusters: {len(self.analyses)}")
         print(f"{'='*80}\n")
-        
-        # Log the new post
-        logger.info(f"New post processed - ID: {post['id']}, Length: {len(post['text'])} chars")
     
 def main():
     """Main function to run the analyzer"""
